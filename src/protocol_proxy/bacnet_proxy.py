@@ -6,17 +6,18 @@ from typing import Sequence
 
 from bacpypes3.app import Application
 from bacpypes3.constructeddata import AnyAtomic
-from bacpypes3.pdu import Address, PDUData
+from bacpypes3.pdu import Address, PDUData, GlobalBroadcast
 from bacpypes3.apdu import (ConfirmedPrivateTransferACK, ConfirmedPrivateTransferError, ConfirmedPrivateTransferRequest,
                             ErrorRejectAbortNack)
 from bacpypes3.primitivedata import ClosingTag, ObjectIdentifier, ObjectType, OpeningTag, Tag, TagList, Unsigned
 from bacpypes3.vendor import get_vendor_info
-
+from bacpypes3.json.util import sequence_to_json
+import ipaddress
 #from volttron.driver.base.proxy import ProtocolProxy
-from volttron.client.logs import setup_logging
+# from volttron.client.logs import setup_logging
 
-setup_logging()
-_log = logging.getLogger(__name__)
+# setup_logging()
+# _log = logging.getLogger(__name__)
 
 class BACnetProxy: #ProtocolProxy):
     def __init__(self, local_address, bacnet_network=0, vendor_id=999, object_name='Excelsior',
@@ -42,6 +43,133 @@ class BACnetProxy: #ProtocolProxy):
             aseID=ase_id
         )
         super(BACnetProxy, self).__init__()  # TODO: Where should super call really be?
+
+    async def scan_ip_range(self, network_str: str) -> list:
+        net = ipaddress.ip_network(network_str, strict=False)
+        tasks = []
+        semaphore = asyncio.Semaphore(20)  # limit concurrency to 20 tasks concurrently
+
+        async def scan_host(ip):
+            async with semaphore:
+                # Use a directed scan on the full BACnet range for each host.
+                results = await self.who_is(0, 4194303, str(ip))
+                # Return tuple of (ip, results) so we know which IP had the device
+                return (str(ip), results)
+
+        for ip in net.hosts():
+            tasks.append(asyncio.create_task(scan_host(ip)))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        discovered = []
+
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            if result and result[1]:
+                ip_address, devices = result
+                # Add the IP address to each device
+                for device in devices:
+                    device['address'] = ip_address
+                discovered.extend(devices)
+
+        return discovered
+
+    #TODO add chunking logic so we dont overwhelm the BACnet network with requests.
+    async def read_device_all(self, device_address: str, device_object_identifier: str) -> dict:
+        properties = [
+            "object-identifier",
+            "object-name",
+            "object-type",
+            "system-status",
+            "vendor-name",
+            "vendor-identifier",
+            "model-name",
+            "firmware-revision",
+            "application-software-version",
+            "location",
+            "description",
+            "protocol-version",
+            "protocol-revision",
+            "protocol-services-supported",
+            "protocol-object-types-supported",
+            "object-list",
+            "structured-object-list",
+            "max-apdu-length-accepted",
+            "segmentation-supported",
+            "max-segments-accepted",
+            "vt-classes-supported",
+            "active-vt-sessions",
+            "local-time",
+            "local-date",
+            "utc-offset",
+            "daylight-savings-status",
+            "apdu-segment-timeout",
+            "apdu-timeout",
+            "number-of-apdu-retries",
+            "time-synchronization-recipients",
+            "max-master",
+            "max-info-frames",
+            "device-address-binding",
+            "database-revision",
+            "configuration-files",
+            "last-restore-time",
+            "backup-failure-timeout",
+            "backup-preparation-time",
+            "restore-preparation-time",
+            "restore-completion-time",
+            "backup-and-restore-state",
+            "active-cov-subscriptions",
+            "last-restart-reason",
+            "time-of-device-restart",
+            "restart-notification-recipients",
+            "utc-time-synchronization-recipients",
+            "time-synchronization-interval",
+            "align-intervals",
+            "interval-offset",
+            "serial-number",
+            "property-list",
+            "status-flags",
+            "event-state",
+            "reliability",
+            "event-detection-enable",
+            "notification-class",
+            "event-enable",
+            "acked-transitions",
+            "notify-type",
+            "event-time-stamps",
+            "event-message-texts",
+            "event-message-texts-config",
+            "reliability-evaluation-inhibit",
+            "active-cov-multiple-subscriptions",
+            "audit-notification-recipient",
+            "audit-level",
+            "auditable-operations",
+            "device-uuid",
+            "tags",
+            "profile-location",
+            "deployed-profile-location",
+            "profile-name",
+        ]
+        device_obj = ObjectIdentifier(device_object_identifier)
+        parameter_list = [device_obj, properties]
+        try:
+            result = await self.app.read_property_multiple(Address(device_address), parameter_list)
+            return result
+        except Exception as e:
+            print("Error reading all properties: %s", e)
+            return {}
+
+    async def who_is(self, device_instance_low, device_instance_high, dest):
+        destination = dest if isinstance(dest, Address) else Address(dest)
+        try:
+            i_am_responses = await self.app.who_is(device_instance_low, device_instance_high, destination)
+            devices = []
+            for i_am in i_am_responses:
+                devices.append(sequence_to_json(i_am))
+            return devices
+        except Exception as e:
+            print("Error sending Who-Is request: %s", e)
+            return []
 
     def query_device(self, address: str, property_name: str = 'object-identifier'):
         """Returns properties about the device at the given address.
